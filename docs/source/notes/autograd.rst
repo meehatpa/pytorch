@@ -36,6 +36,51 @@ flow statements, that can change the overall shape and size of the graph at
 every iteration. You don't have to encode all possible paths before you
 launch the training - what you run is what you differentiate.
 
+.. _saved-tensors-doc:
+
+Saved tensors
+^^^^^^^^^^^^^
+
+Some operations need intermediary results to be saved during the forward pass
+in order to execute the backward pass. For example, the function
+:math:`x\mapsto x^2` needs to save the input :math:`x` because it is needed to
+compute the gradient.
+
+When defining a custom Python :class:`~torch.autograd.Function`, you can use
+:func:`~torch.autograd.function._ContextMethodMixin.save_for_backward` to save
+tensors during the forward pass and
+:attr:`~torch.autograd.function.NestedIOFunction.saved_tensors` to retrieve them
+during the backward pass. See :doc:`/notes/extending` for more information.
+
+For operations that Pytorch defines (e.g. ``aten::pow``), tensors are
+automatically saved as they are needed. You can explore which tensors are saved
+by a certain ``grad_fn`` by looking for its attributes starting with the prefix
+``_saved``.
+
+.. code::
+
+    x = torch.randn(5, requires_grad=True)
+    y = x.pow(2)
+    print(x.equal(y.grad_fn._saved_self)) # True
+    print(x is y.grad_fn._saved_self) # True
+
+
+In the previous code, ``y.grad_fn._saved_self`` shares the same storage as `x`.
+But that may not always be the case. For instance:
+
+.. code::
+
+    x = torch.randn(5, requires_grad=True)
+    y = x.exp()
+    print(y.equal(y.grad_fn._saved_result)) # True
+    print(y is y.grad_fn._saved_result) # False
+
+
+Under the hood, to prevent reference cycles, PyTorch has *packed* the tensor
+upon saving and *unpacked* it into a different tensor for reading.  You can
+control how Pytorch does packing / unpacking with
+:ref:`saved-tensors-hooks-doc`.
+
 .. _locally-disable-grad-doc:
 
 Locally disabling gradient computation
@@ -598,3 +643,83 @@ chain rule:
 
         .. math::
             \frac{\partial L}{\partial z^*} = 2 * Re(grad\_out^* * \frac{\partial s}{\partial z^{*}})
+
+.. _saved-tensors-hooks-doc:
+
+Hooks for saved tensors
+-----------------------
+
+You can control :ref:`how saved tensors are packed / unpacked
+<saved-tensors-doc>` by defining a pair of ``pack_hook`` / ``unpack_hook`` hooks.
+The ``pack_hook`` function should take a tensor as its single argument but can
+return any python object (e.g. another tensor, a tuple, or even a filename).
+The ``unpack_hook`` function takes as its single argument the output of
+``pack_hook`` and should return the original tensor to be used in the backward
+pass.
+
+An example of such pair is:
+
+.. code::
+
+    def pack_hook(x):
+        name = os.path.join(tmp_dir, str(uuid.uuid4()))
+        torch.save(x, name)
+        return name
+
+    def unpack_hook(name):
+        return torch.load(name)
+
+.. warning::
+
+    Both functions should avoid performing inplace operations on the input or
+    undefined behavior may arise.
+
+
+Registering hooks for a saved tensor
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can register a pair of hooks on a saved tensor by calling the
+:meth:`~torch.autograd.SavedTensor.register_hooks` method on a
+:class:`SavedTensor` object. Those objects are exposed as attributes of a
+``grad_fn`` and start with the ``_raw_saved_`` prefix.
+
+.. code::
+
+    x = torch.randn(5, requires_grad=True)
+    y = x.pow(2)
+    y.grad_fn._raw_saved_self.register_hooks(pack_hook, unpack_hook)
+
+The ``pack_hook`` method is called as soon as the pair is registered.
+The ``unpack_hook`` method is called each time the saved tensor needs to be
+accessed, either by means of ``y.grad_fn._saved_self`` or during the backward
+pass.
+
+.. warning::
+
+    If you maintain a reference to a :class:`SavedTensor` after the saved
+    tensors have been released (i.e. after backward has been called) and call
+    its :meth:`~torch.autograd.SavedTensor.register_hooks`, undefined behavior
+    may arise. Pytorch will throw an error most of the time but it may fail
+    silently in some cases.
+
+Registering default hooks for saved tensors
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Alternatively, you can register a pair of default hooks which will be applied
+to all saved tensors that are created in that context.
+
+Note that using a pair of identity hooks is not a no-op as it forces
+packing / unpacking even in cases where Pytorch would have chosen to share storage.
+For example:
+
+.. code::
+
+    torch.autograd.graph.set_saved_tensors_default_hooks(lambda x: x, lambda x: x)
+    x = torch.randn(5, requires_grad=True)
+    y = x * x
+    torch.autograd.graph.reset_saved_tensors_default_hooks()
+
+Without the hooks, ``x``, ``y.grad_fn._saved_self`` and
+``y.grad_fn._saved_other`` all point to the same tensor.
+With the hooks, Pytorch will pack and unpack `x` into two new tensors
+that share the same storage with the original `x` (no copy performed).
